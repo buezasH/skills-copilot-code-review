@@ -1,15 +1,167 @@
 """
-MongoDB database configuration and setup for Mergington High School API
+In-memory database configuration and setup for Mergington High School API
 """
 
-from pymongo import MongoClient
+import copy
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+# ---------------------------------------------------------------------------
+# Lightweight in-memory collection that mimics the subset of the PyMongo API
+# used by the routers (find, find_one, update_one, aggregate, insert_one,
+# count_documents).
+# ---------------------------------------------------------------------------
+
+class _UpdateResult:
+    """Minimal stand-in for pymongo.results.UpdateResult."""
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    """Dict-backed collection that exposes a PyMongo-compatible interface."""
+
+    def __init__(self):
+        self._docs: dict = {}  # keyed by _id
+
+    # -- helpers --------------------------------------------------------
+    @staticmethod
+    def _matches(doc: dict, query: dict) -> bool:
+        """Evaluate a *simple* MongoDB-style query against a document."""
+        for key, condition in query.items():
+            value = doc
+            for part in key.split("."):
+                if isinstance(value, dict):
+                    value = value.get(part)
+                else:
+                    value = None
+                    break
+
+            if isinstance(condition, dict):
+                for op, operand in condition.items():
+                    if op == "$in":
+                        if not isinstance(value, list):
+                            if value not in operand:
+                                return False
+                        else:
+                            if not any(v in operand for v in value):
+                                return False
+                    elif op == "$gte":
+                        if value is None or value < operand:
+                            return False
+                    elif op == "$lte":
+                        if value is None or value > operand:
+                            return False
+            else:
+                if value != condition:
+                    return False
+        return True
+
+    # -- public PyMongo-like API ----------------------------------------
+    def count_documents(self, filter: dict) -> int:
+        if not filter:
+            return len(self._docs)
+        return sum(1 for d in self._docs.values() if self._matches(d, filter))
+
+    def insert_one(self, document: dict):
+        doc = copy.deepcopy(document)
+        _id = doc.get("_id")
+        self._docs[_id] = doc
+
+    def find_one(self, filter: dict):
+        _id = filter.get("_id")
+        if _id is not None and len(filter) == 1:
+            doc = self._docs.get(_id)
+            return copy.deepcopy(doc) if doc else None
+        for doc in self._docs.values():
+            if self._matches(doc, filter):
+                return copy.deepcopy(doc)
+        return None
+
+    def find(self, filter: dict | None = None):
+        results = []
+        for doc in self._docs.values():
+            if filter and not self._matches(doc, filter):
+                continue
+            results.append(copy.deepcopy(doc))
+        return results
+
+    def update_one(self, filter: dict, update: dict) -> _UpdateResult:
+        doc = None
+        _id = filter.get("_id")
+        if _id is not None:
+            doc = self._docs.get(_id)
+        else:
+            for d in self._docs.values():
+                if self._matches(d, filter):
+                    doc = d
+                    break
+        if doc is None:
+            return _UpdateResult(0)
+
+        for op, fields in update.items():
+            for field, value in fields.items():
+                if op == "$push":
+                    doc.setdefault(field, []).append(value)
+                elif op == "$pull":
+                    lst = doc.get(field, [])
+                    if value in lst:
+                        lst.remove(value)
+                elif op == "$set":
+                    doc[field] = value
+        return _UpdateResult(1)
+
+    def aggregate(self, pipeline: list):
+        """Very minimal aggregation: supports $unwind, $group, $sort."""
+        docs = list(copy.deepcopy(d) for d in self._docs.values())
+        for stage in pipeline:
+            if "$unwind" in stage:
+                field = stage["$unwind"].lstrip("$")
+                parts = field.split(".")
+                new_docs = []
+                for doc in docs:
+                    value = doc
+                    for p in parts:
+                        value = value.get(p, []) if isinstance(value, dict) else []
+                    if isinstance(value, list):
+                        for v in value:
+                            d = copy.deepcopy(doc)
+                            # set nested value
+                            obj = d
+                            for p in parts[:-1]:
+                                obj = obj[p]
+                            obj[parts[-1]] = v
+                            new_docs.append(d)
+                    else:
+                        new_docs.append(doc)
+                docs = new_docs
+            elif "$group" in stage:
+                groups: dict = {}
+                group_spec = stage["$group"]
+                id_expr = group_spec["_id"]
+                if isinstance(id_expr, str) and id_expr.startswith("$"):
+                    key_path = id_expr.lstrip("$").split(".")
+                else:
+                    key_path = None
+                for doc in docs:
+                    if key_path:
+                        val = doc
+                        for p in key_path:
+                            val = val.get(p) if isinstance(val, dict) else None
+                    else:
+                        val = id_expr
+                    groups[val] = {"_id": val}
+                docs = list(groups.values())
+            elif "$sort" in stage:
+                sort_spec = stage["$sort"]
+                for key, direction in reversed(sort_spec.items()):
+                    docs.sort(key=lambda d, k=key: d.get(k, ""), reverse=(direction == -1))
+        return docs
+
+
+# Create in-memory collections
+activities_collection = InMemoryCollection()
+teachers_collection = InMemoryCollection()
 
 # Methods
 
